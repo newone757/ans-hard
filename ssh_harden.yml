@@ -1,0 +1,192 @@
+---
+# Step 0: Control node SSH key generation
+- name: Ensure control node has an SSH key
+  hosts: localhost
+  gather_facts: false
+  vars:
+    new_ssh_port: 2022
+    local_username: local
+  tasks:
+    - name: Ensure .ssh directory exists
+      file:
+        path: "{{ lookup('env','HOME') }}/.ssh"
+        state: directory
+        mode: 0700
+
+    - name: Generate SSH key if missing
+      openssh_keypair:
+        path: "{{ lookup('env','HOME') }}/.ssh/id_rsa"
+        type: rsa
+        size: 4096
+        mode: 0600
+      register: keypair
+      ignore_errors: yes
+
+    - name: Register public key content
+      set_fact:
+        local_pubkey_content: >-
+          {{ keypair.public_key
+             if keypair is defined and keypair.public_key is defined
+             else lookup('file', lookup('env','HOME') + '/.ssh/id_rsa.pub') }}
+
+# Step 1: Bootstrap local user and new SSH port
+- name: Bootstrap 'local' user and configure SSH
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    new_ssh_port: 2022
+    local_username: local
+    admin_group: "{{ 'sudo' if ansible_os_family == 'Debian' else 'wheel' }}"
+    sshd_service_name: "{{ 'ssh' if ansible_os_family == 'Debian' else 'sshd' }}"
+  pre_tasks:
+    - name: Ensure sudo package exists
+      package:
+        name: sudo
+        state: present
+
+    - name: Ensure admin group exists
+      group:
+        name: "{{ admin_group }}"
+        state: present
+
+  tasks:
+    - name: Create {{ local_username }} user
+      user:
+        name: "{{ local_username }}"
+        groups: "{{ admin_group }}"
+        append: true
+        shell: /bin/bash
+        create_home: true
+
+    - name: Allow passwordless sudo
+      copy:
+        dest: "/etc/sudoers.d/{{ local_username }}"
+        content: "{{ local_username }} ALL=(ALL) NOPASSWD:ALL\n"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "visudo -cf %s"
+
+    - name: Install public key for {{ local_username }}
+      authorized_key:
+        user: "{{ local_username }}"
+        state: present
+        key: "{{ hostvars['localhost']['local_pubkey_content'] }}"
+
+    - name: Change SSH port to {{ new_ssh_port }}
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^Port'
+        line: "Port {{ new_ssh_port }}"
+        backup: yes
+      notify: Restart sshd
+
+    - name: Ensure PubkeyAuthentication is enabled
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PubkeyAuthentication'
+        line: 'PubkeyAuthentication yes'
+        backup: yes
+      notify: Restart sshd
+
+    - name: Generate inventory.ini for future runs
+      delegate_to: localhost
+      run_once: true
+      copy:
+        dest: "./inventory.ini"
+        content: |
+          [all]
+          {% for host in groups['all'] %}
+          {{ host }} ansible_host={{ hostvars[host]['ansible_host'] }} ansible_user=local ansible_port={{ new_ssh_port }}
+          {% endfor %}
+      changed_when: false
+
+  handlers:
+    - name: Restart sshd
+      service:
+        name: "{{ sshd_service_name }}"
+        state: restarted
+
+# Step 2: Restart SSH
+- name: Restart systemd daemon and SSH service
+  hosts: all
+  become: yes
+  tasks:
+    - name: Reload systemd manager configuration
+      ansible.builtin.command:
+        cmd: systemctl daemon-reload
+
+    - name: Restart SSH service (sshd or ssh)
+      ansible.builtin.service:
+        name: "{{ 'sshd' if ansible_facts['os_family'] != 'Debian' else 'ssh' }}"
+        state: restarted
+
+
+# Step 3: Verify key-based login works
+- name: Verify key-based login
+  hosts: all
+  gather_facts: false
+  vars:
+    new_ssh_port: 2022
+    local_username: local
+    ansible_user: "{{ local_username }}"
+    ansible_port: "{{ new_ssh_port }}"
+  tasks:
+    - name: Ping test
+      ping:
+      register: ping_result
+
+    - name: Fail if SSH key login failed
+      fail:
+        msg: "Key-based SSH login failed. Aborting hardening."
+      when: ping_result is failed
+
+# Step 4: Harden SSH safely
+- name: Harden SSH (only if verification passed)
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    new_ssh_port: 2022
+    local_username: local
+    sshd_service_name: "{{ 'ssh' if ansible_os_family == 'Debian' else 'sshd' }}"
+  tasks:
+    - name: Disallow root login
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PermitRootLogin'
+        line: 'PermitRootLogin no'
+        backup: yes
+      notify: Restart sshd
+
+    - name: Disable password authentication
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+        backup: yes
+      notify: Restart sshd
+
+    - name: Disable challenge-response authentication
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^ChallengeResponseAuthentication'
+        line: 'ChallengeResponseAuthentication no'
+        backup: yes
+      notify: Restart sshd
+
+    - name: Restrict SSH to only {{ local_username }}
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^AllowUsers'
+        line: "AllowUsers {{ local_username }}"
+        backup: yes
+      notify: Restart sshd
+
+  handlers:
+    - name: Restart sshd
+      service:
+        name: "{{ sshd_service_name }}"
+        state: restarted
+
