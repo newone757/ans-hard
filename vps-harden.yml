@@ -1,0 +1,630 @@
+---
+# VPS Setup and Hardening Playbook - Fixed Version
+# Run with: ansible-playbook -i inventory.ini vps-setup-fixed.yml --ask-vault-pass
+
+# First, detect if the playbook has been run before
+- name: Detect Server State and SSH Configuration
+  hosts: vps_servers
+  gather_facts: no
+  vars:
+    admin_username: "{{ vault_admin_username }}"
+    admin_password: "{{ vault_admin_password }}"
+    new_ssh_port: "{{ vault_ssh_port }}"
+  
+  tasks:
+    # Check port 22 first - if accessible, treat as fresh server
+    - name: Check if standard port 22 is accessible
+      wait_for:
+        port: 22
+        host: "{{ ansible_host }}"
+        timeout: 5
+      delegate_to: localhost
+      register: port_22_check
+      ignore_errors: yes
+
+    # If port 22 is accessible, it's a fresh server (regardless of SSH auth method)
+    - name: Set server state - fresh (port 22 accessible)
+      set_fact:
+        server_state: "fresh"
+        detected_ssh_port: "22"
+        detected_user: "root"
+      when: port_22_check is succeeded
+
+    # Only check custom port if port 22 is not accessible
+    - name: Check custom port if port 22 failed
+      wait_for:
+        port: "{{ new_ssh_port }}"
+        host: "{{ ansible_host }}"
+        timeout: 5
+      delegate_to: localhost
+      register: custom_port_check
+      ignore_errors: yes
+      when: port_22_check is failed
+
+    - name: Test admin user SSH access on custom port
+      command: ssh -i ~/.ssh/vps_management_key -o BatchMode=yes -o ConnectTimeout=5 -p {{ new_ssh_port }} {{ admin_username }}@{{ ansible_host }} echo "success"
+      delegate_to: localhost
+      register: admin_custom_port_test
+      ignore_errors: yes
+      when: 
+        - port_22_check is failed
+        - custom_port_check is succeeded
+      changed_when: false
+
+    # Set configured state only if custom port works and port 22 doesn't
+    - name: Set server state - configured (custom port works, port 22 blocked)
+      set_fact:
+        server_state: "configured"
+        detected_ssh_port: "{{ new_ssh_port }}"
+        detected_user: "{{ admin_username }}"
+      when: 
+        - port_22_check is failed
+        - admin_custom_port_test is succeeded
+
+    # Set unknown state if neither port works
+    - name: Set server state - unknown (no ports accessible)
+      set_fact:
+        server_state: "unknown"
+        detected_ssh_port: "22"
+        detected_user: "unknown"
+      when: 
+        - port_22_check is failed
+        - (custom_port_check is failed or admin_custom_port_test is failed or admin_custom_port_test is skipped)
+
+    - name: Display detected configuration
+      debug:
+        msg:
+          - "Server state: {{ server_state }}"
+          - "SSH port: {{ detected_ssh_port }}"
+          - "Connection user: {{ detected_user }}"
+          - "Logic: {{ 'Port 22 accessible = fresh server' if server_state == 'fresh' else 'Port 22 blocked, custom port works = configured' if server_state == 'configured' else 'No ports accessible = unknown' }}"
+          - "Will {{ 'perform initial setup' if server_state == 'fresh' else 'run as configured server' if server_state == 'configured' else 'skip server' }}"
+
+# Setup SSH keys on control node
+- name: Setup SSH keys on control node
+  hosts: localhost
+  connection: local
+  become: no
+  gather_facts: yes
+  tasks:
+    - name: Generate SSH key pair for management
+      openssh_keypair:
+        path: ~/.ssh/vps_management_key
+        type: rsa
+        size: 4096
+        comment: "VPS Management Key - {{ ansible_date_time.iso8601 }}"
+        force: no
+
+    - name: Check if SSH key was created
+      stat:
+        path: ~/.ssh/vps_management_key
+      register: ssh_key_check
+
+    - name: Display SSH key status
+      debug:
+        msg: "SSH management key available at ~/.ssh/vps_management_key"
+      when: ssh_key_check.stat.exists
+
+# Initial setup for fresh servers
+- name: Initial VPS Setup and Hardening
+  hosts: vps_servers
+  gather_facts: yes
+  vars:
+    new_ssh_port: "{{ vault_ssh_port }}"
+    admin_username: "{{ vault_admin_username }}"
+    admin_password: "{{ vault_admin_password }}"
+    # Use simple conditionals for connection settings
+    ansible_user: "{{ hostvars[inventory_hostname]['detected_user'] }}"
+    ansible_port: "{{ hostvars[inventory_hostname]['detected_ssh_port'] }}"
+    ansible_ssh_pass: "{{ hostvars[inventory_hostname]['vault_root_password'] if hostvars[inventory_hostname]['server_state'] == 'fresh' else omit }}"
+    ansible_become: "{{ 'yes' if hostvars[inventory_hostname]['server_state'] == 'configured' else 'no' }}"
+    ansible_become_pass: "{{ admin_password if hostvars[inventory_hostname]['server_state'] == 'configured' else omit }}"
+    
+  tasks:
+    - name: Skip if server state is unknown
+      meta: end_play
+      when: hostvars[inventory_hostname]['server_state'] == 'unknown'
+
+    - name: Display connection info for debugging
+      debug:
+        msg:
+          - "Connecting to {{ ansible_host }}:{{ ansible_port }} as {{ ansible_user }}"
+          - "Server state: {{ hostvars[inventory_hostname]['server_state'] }}"
+          - "Using password auth: {{ 'yes' if ansible_ssh_pass is defined else 'no' }}"
+
+    # System updates
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+
+    - name: Upgrade all packages
+      apt:
+        upgrade: dist
+        autoremove: yes
+        autoclean: yes
+      when: ansible_os_family == "Debian"
+
+    # User Management (only for fresh servers)
+    - name: Create admin user with sudo privileges
+      user:
+        name: "{{ admin_username }}"
+        password: "{{ admin_password | password_hash('sha512') }}"
+        shell: /bin/bash
+        createhome: yes
+        groups: sudo
+        append: yes
+        state: present
+      become: "{{ ansible_become | default(omit) }}"
+      when: hostvars[inventory_hostname]['server_state'] == 'fresh'
+
+    - name: Create .ssh directory for admin user
+      file:
+        path: "/home/{{ admin_username }}/.ssh"
+        state: directory
+        owner: "{{ admin_username }}"
+        group: "{{ admin_username }}"
+        mode: '0700'
+      become: "{{ ansible_become | default(omit) }}"
+      when: hostvars[inventory_hostname]['server_state'] == 'fresh'
+
+    - name: Copy SSH public key to admin user
+      authorized_key:
+        user: "{{ admin_username }}"
+        state: present
+        key: "{{ lookup('file', '~/.ssh/vps_management_key.pub') }}"
+        comment: "VPS Management Key"
+      become: "{{ ansible_become | default(omit) }}"
+      when: hostvars[inventory_hostname]['server_state'] == 'fresh'
+
+    # SSH Configuration (only for fresh servers)
+    - name: Backup original SSH config
+      copy:
+        src: /etc/ssh/sshd_config
+        dest: /etc/ssh/sshd_config.backup.{{ ansible_date_time.epoch }}
+        remote_src: yes
+      become: "{{ ansible_become | default(omit) }}"
+      when: hostvars[inventory_hostname]['server_state'] == 'fresh'
+
+    - name: Configure SSH - Phase 1 (allow both root and admin)
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        backup: yes
+        validate: 'sshd -t -f %s'
+      loop:
+        - { regexp: '^#?Port', line: "Port {{ new_ssh_port }}" }
+        - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin yes' }
+        - { regexp: '^#?PubkeyAuthentication', line: 'PubkeyAuthentication yes' }
+        - { regexp: '^#?AuthorizedKeysFile', line: 'AuthorizedKeysFile .ssh/authorized_keys' }
+        - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication yes' }
+      register: ssh_config_phase1
+      become: "{{ ansible_become | default(omit) }}"
+      when: hostvars[inventory_hostname]['server_state'] == 'fresh'
+
+    - name: Test SSH configuration
+      command: sshd -t
+      changed_when: false
+      become: "{{ ansible_become | default(omit) }}"
+      when: ssh_config_phase1 is changed
+
+    # Without this the ssh service in the next step often doesn't actually restat
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+      when: ssh_config_phase1 is changed
+
+    # Without this the ssh service in the next step often doesn't actually restat
+    - name: Restart SSH socket
+      systemd:
+        name: ssh.socket
+        state: restarted
+      when: ssh_config_phase1 is changed
+
+    - name: Restart SSH service for phase 1
+      systemd:
+        name: "{{ 'ssh' if ansible_os_family == 'Debian' else 'sshd' }}"
+        state: restarted
+      become: "{{ ansible_become | default(omit) }}"
+      when: ssh_config_phase1 is changed
+
+    - name: Wait for SSH to come back up
+      wait_for:
+        port: "{{ new_ssh_port }}"
+        host: "{{ ansible_host }}"
+        delay: 5
+        timeout: 30
+      delegate_to: localhost
+      when: ssh_config_phase1 is changed
+
+# Complete hardening (runs for all servers)
+- name: Complete Server Hardening
+  hosts: vps_servers
+  gather_facts: yes
+  vars:
+    new_ssh_port: "{{ vault_ssh_port }}"
+    admin_username: "{{ vault_admin_username }}"
+    admin_password: "{{ vault_admin_password }}"
+    # Always connect as admin user for this phase
+    ansible_user: "{{ vault_admin_username }}"
+    ansible_port: "{{ vault_ssh_port }}"
+    ansible_become: yes
+    ansible_become_pass: "{{ admin_password }}"
+  
+  tasks:
+    - name: Skip if server state is unknown
+      meta: end_play
+      when: hostvars[inventory_hostname]['server_state'] == 'unknown'
+
+    - name: Test sudo access for admin user
+      command: whoami
+      become: yes
+      register: sudo_test
+      failed_when: sudo_test.stdout != "root"
+
+    # Get control node IP (again for this play)
+    - name: Get control node IP address
+      set_fact:
+        control_node_ip: "{{ ansible_env.SSH_CLIENT.split()[0] }}"
+      when: ansible_env.SSH_CLIENT is defined
+
+# Final SSH Hardening (only for fresh servers)
+      
+    # Find all SSH config files
+    - name: Find SSH configuration files
+      find:
+        paths:
+          - /etc/ssh/
+          - /etc/ssh/sshd_config.d/
+        patterns: 
+          - "sshd_config"
+          - "*.conf"
+        file_type: file
+      register: ssh_config_files
+
+    # Apply hardening to all found config files
+    - name: Apply final SSH hardening configuration to all config files
+      lineinfile:
+        path: "{{ item[0].path }}"
+        regexp: "{{ item[1].regexp }}"
+        line: "{{ item[1].line }}"
+        backup: yes
+        validate: 'sshd -t -f %s'
+      loop: "{{ ssh_config_files.files | product(ssh_hardening_rules) | list }}"
+      vars:
+        ssh_hardening_rules:
+          - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin no' }
+          - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+          - { regexp: '^#?ChallengeResponseAuthentication', line: 'ChallengeResponseAuthentication no' }
+          - { regexp: '^#?UsePAM', line: 'UsePAM no' }
+          - { regexp: '^#?X11Forwarding', line: 'X11Forwarding no' }
+          - { regexp: '^#?PrintMotd', line: 'PrintMotd no' }
+          - { regexp: '^#?TCPKeepAlive', line: 'TCPKeepAlive no' }
+          - { regexp: '^#?Compression', line: 'Compression no' }
+          - { regexp: '^#?AllowAgentForwarding', line: 'AllowAgentForwarding no' }
+          - { regexp: '^#?AllowTcpForwarding', line: 'AllowTcpForwarding no' }
+          - { regexp: '^#?MaxAuthTries', line: 'MaxAuthTries 3' }
+          - { regexp: '^#?MaxSessions', line: 'MaxSessions 2' }
+          - { regexp: '^#?ClientAliveInterval', line: 'ClientAliveInterval 300' }
+          - { regexp: '^#?ClientAliveCountMax', line: 'ClientAliveCountMax 2' }
+          - { regexp: '^#?LoginGraceTime', line: 'LoginGraceTime 30' }
+          - { regexp: '^#?Protocol', line: 'Protocol 2' }
+      register: ssh_final_config
+      #when: hostvars[inventory_hostname]['server_state'] == 'fresh'
+
+    # Add SSH user restriction to main config only
+    - name: Add SSH user restriction
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        line: "AllowUsers {{ admin_username }}"
+        insertafter: EOF
+      register: ssh_user_restriction
+      #when: hostvars[inventory_hostname]['server_state'] == 'fresh'
+
+    # Add SSH crypto restrictions to main config only
+    - name: Add SSH crypto restrictions
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        block: |
+          # Restrict key exchange, cipher, and MAC algorithms
+          KexAlgorithms curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group14-sha256
+          Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+          MACs hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,hmac-sha2-256,hmac-sha2-512
+        marker: "# {mark} ANSIBLE MANAGED SSH CRYPTO BLOCK"
+        validate: 'sshd -t -f %s'
+      register: ssh_crypto
+      #when: hostvars[inventory_hostname]['server_state'] == 'fresh'
+
+    # Without this the ssh service in the next step often doesn't actually restat
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+      when: ssh_final_config is changed or ssh_user_restriction is changed or ssh_crypto is changed
+
+    # Without this the ssh service in the next step often doesn't actually restat
+    - name: Restart SSH socket
+      systemd:
+        name: ssh.socket
+        state: restarted
+      when: ssh_final_config is changed or ssh_user_restriction is changed or ssh_crypto is changed
+
+    - name: Restart SSH service for final configuration
+      systemd:
+        name: "{{ 'ssh' if ansible_os_family == 'Debian' else 'sshd' }}"
+        state: restarted
+      when: ssh_final_config is changed or ssh_user_restriction is changed or ssh_crypto is changed
+
+    # Firewall Configuration
+    - name: Install UFW
+      apt:
+        name: ufw
+        state: present
+
+    - name: Check existing UFW rules
+      command: ufw status numbered
+      register: ufw_existing_rules
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Reset UFW to defaults (fresh servers only)
+      ufw:
+        state: reset
+      when: hostvars[inventory_hostname]['server_state'] == 'fresh'
+
+    - name: Set UFW default policies
+      ufw:
+        direction: "{{ item.direction }}"
+        policy: "{{ item.policy }}"
+      loop:
+        - { direction: 'incoming', policy: 'deny' }
+        - { direction: 'outgoing', policy: 'allow' }
+
+    - name: Allow SSH on custom port
+      ufw:
+        rule: allow
+        port: "{{ new_ssh_port }}"
+        proto: tcp
+        comment: "SSH on custom port"
+
+    - name: Allow HTTP traffic
+      ufw:
+        rule: allow
+        port: '80'
+        proto: tcp
+        comment: "HTTP"
+
+    - name: Allow HTTPS traffic
+      ufw:
+        rule: allow
+        port: '443'
+        proto: tcp
+        comment: "HTTPS"
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+        logging: 'on'
+
+    # Fail2Ban Installation and Configuration
+    - name: Install Fail2Ban
+      apt:
+        name: 
+          - fail2ban
+          - python3-systemd
+        state: present
+
+    - name: Create Fail2Ban local jail configuration
+      copy:
+        content: |
+          [DEFAULT]
+          bantime = 3600
+          findtime = 600
+          maxretry = 5
+          backend = systemd
+          
+          [sshd]
+          enabled = true
+          port = {{ vault_ssh_port }}
+          logpath = /var/log/auth.log
+          maxretry = 3
+          bantime = 7200
+          findtime = 600
+          
+          [sshd-aggressive]
+          enabled = true
+          port = {{ vault_ssh_port }}
+          filter = sshd
+          logpath = /var/log/auth.log
+          maxretry = 2
+          bantime = 86400
+          findtime = 3600
+          
+          [ufw]
+          enabled = true
+          port = any
+          filter = ufw
+          logpath = /var/log/ufw.log
+          maxretry = 10
+          
+          [apache-auth]
+          enabled = true
+          
+          [apache-noscript]
+          enabled = true
+          
+          [apache-overflows]
+          enabled = true
+        dest: /etc/fail2ban/jail.local
+        owner: root
+        group: root
+        mode: '0644'
+      register: fail2ban_config
+
+    - name: Create custom UFW filter for Fail2Ban
+      copy:
+        content: |
+          [Definition]
+          failregex = .*\[UFW BLOCK\].*SRC=<HOST>
+          ignoreregex =
+        dest: /etc/fail2ban/filter.d/ufw.conf
+        owner: root
+        group: root
+        mode: '0644'
+      register: fail2ban_filter
+
+    - name: Restart Fail2Ban
+      service:
+        name: fail2ban
+        state: restarted
+        enabled: yes
+      when: fail2ban_config is changed or fail2ban_filter is changed
+
+    - name: Ensure Fail2Ban is started and enabled
+      service:
+        name: fail2ban
+        state: started
+        enabled: yes
+
+    # Continue with system hardening tasks...
+    # [Rest of the hardening tasks from the original playbook go here]
+    
+    # Install security packages
+    - name: Install essential security packages
+      apt:
+        name:
+          - apt-show-versions
+          - chkrootkit
+          - rkhunter
+          - lynis
+          - aide
+          - logwatch
+          - unattended-upgrades
+          - needrestart
+        state: present
+
+    # Configure automatic updates
+    - name: Configure automatic security updates
+      lineinfile:
+        path: /etc/apt/apt.conf.d/50unattended-upgrades
+        regexp: '^//\s*"${distro_id}:${distro_codename}-security";'
+        line: '        "${distro_id}:${distro_codename}-security";'
+        backup: yes
+
+    - name: Enable automatic updates
+      copy:
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Download-Upgradeable-Packages "1";
+          APT::Periodic::AutocleanInterval "7";
+          APT::Periodic::Unattended-Upgrade "1";
+        dest: /etc/apt/apt.conf.d/02periodic
+        owner: root
+        group: root
+        mode: '0644'
+
+    # Apply kernel security settings
+    - name: Apply kernel security settings
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+        sysctl_file: /etc/sysctl.d/99-security.conf
+      loop:
+        # Network security
+        - { key: 'net.ipv4.ip_forward', value: '0' }
+        - { key: 'net.ipv4.conf.all.send_redirects', value: '0' }
+        - { key: 'net.ipv4.conf.default.send_redirects', value: '0' }
+        - { key: 'net.ipv4.conf.all.accept_redirects', value: '0' }
+        - { key: 'net.ipv4.conf.default.accept_redirects', value: '0' }
+        - { key: 'net.ipv4.conf.all.secure_redirects', value: '0' }
+        - { key: 'net.ipv4.conf.default.secure_redirects', value: '0' }
+        - { key: 'net.ipv4.conf.all.accept_source_route', value: '0' }
+        - { key: 'net.ipv4.conf.default.accept_source_route', value: '0' }
+        - { key: 'net.ipv4.conf.all.log_martians', value: '1' }
+        - { key: 'net.ipv4.conf.default.log_martians', value: '1' }
+        - { key: 'net.ipv4.icmp_echo_ignore_broadcasts', value: '1' }
+        - { key: 'net.ipv4.icmp_ignore_bogus_error_responses', value: '1' }
+        - { key: 'net.ipv4.tcp_syncookies', value: '1' }
+        - { key: 'net.ipv4.tcp_rfc1337', value: '1' }
+        # Memory protection
+        - { key: 'kernel.dmesg_restrict', value: '1' }
+        - { key: 'kernel.kptr_restrict', value: '2' }
+        - { key: 'kernel.yama.ptrace_scope', value: '1' }
+        - { key: 'fs.protected_hardlinks', value: '1' }
+        - { key: 'fs.protected_symlinks', value: '1' }
+
+# Final cleanup and verification
+- name: Final Security Cleanup and Verification
+  hosts: vps_servers
+  gather_facts: no
+  vars:
+    admin_username: "{{ vault_admin_username }}"
+    admin_password: "{{ vault_admin_password }}"
+    ansible_user: "{{ vault_admin_username }}"
+    ansible_port: "{{ vault_ssh_port }}"
+    ansible_become: yes
+    ansible_become_pass: "{{ admin_password }}"
+  
+  tasks:
+    - name: Skip if server state is unknown
+      meta: end_play
+      when: hostvars[inventory_hostname]['server_state'] == 'unknown'
+
+    - name: Verify SSH configuration
+      command: sshd -t
+
+    - name: Check UFW status
+      command: ufw status verbose
+      register: ufw_status
+
+    - name: Check Fail2Ban status
+      command: fail2ban-client status
+      register: fail2ban_status
+
+    - name: Check Fail2Ban SSH jail status
+      command: fail2ban-client status sshd
+      register: fail2ban_sshd_status
+
+    - name: Display final security status
+      debug:
+        msg:
+          - "=== Security Setup Complete ==="
+          - "SSH Port: {{ vault_ssh_port }}"
+          - "Admin User: {{ admin_username }}"
+          - "Root Login: Disabled"
+          - "Password Auth: Disabled"
+          - "UFW Status: {{ ufw_status.stdout_lines[0] | default('Unknown') }}"
+          - "Fail2Ban Status: {{ fail2ban_status.stdout_lines[0] | default('Unknown') }}"
+          - "Server State: {{ hostvars[inventory_hostname]['server_state'] }}"
+
+    - name: Create security report
+      copy:
+        content: |
+          VPS Security Configuration Report
+          ==================================
+          Date: {{ ansible_date_time.iso8601 }}
+          Hostname: {{ ansible_hostname }}
+          
+          Configuration Summary:
+          - SSH Port: {{ vault_ssh_port }}
+          - Admin User: {{ admin_username }}
+          - Root SSH Access: Disabled
+          - Password Authentication: Disabled
+          - Firewall: UFW Enabled
+          - Intrusion Prevention: Fail2Ban Active
+          - Automatic Updates: Enabled
+          - Kernel Hardening: Applied
+          
+          Next Steps:
+          1. Ensure you have saved your SSH private key
+          2. Test SSH connection: ssh -p {{ vault_ssh_port }} {{ admin_username }}@{{ ansible_host }}
+          3. Monitor /var/log/auth.log for suspicious activity
+          4. Review Fail2Ban logs: sudo fail2ban-client status sshd
+          5. Schedule regular security audits with: sudo lynis audit system
+        dest: "/home/{{ admin_username }}/security-report.txt"
+        owner: "{{ admin_username }}"
+        group: "{{ admin_username }}"
+        mode: '0600'

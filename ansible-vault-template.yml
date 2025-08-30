@@ -1,0 +1,26 @@
+---
+# Ansible Vault file for VPS setup
+# Create this file with: ansible-vault create group_vars/all/vault.yml
+# Edit with: ansible-vault edit group_vars/all/vault.yml
+# Encrypt existing file: ansible-vault encrypt group_vars/all/vault.yml
+
+# Global configuration for all VPS servers
+vault_ssh_port: 2222  # Custom SSH port to use (change this!)
+vault_admin_username: sysadmin  # Non-root admin username
+vault_admin_password: "changeme123!@#"  # Strong password for admin user
+
+# Per-host root passwords (for initial connection)
+# These are only used for the first run when connecting as root
+vault_root_passwords:
+  vps1: "root_password_for_vps1"
+  vps2: "root_password_for_vps2"
+  vps3: "root_password_for_vps3"
+
+# You can also define host-specific settings if needed
+# vault_host_specific:
+#   vps1:
+#     ssh_port: 2222
+#     admin_user: admin1
+#   vps2:
+#     ssh_port: 2223
+#     admin_user: admin2
